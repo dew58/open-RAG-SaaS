@@ -1,0 +1,149 @@
+# ── Networks ───────────────────────────────────────────────────────────────────
+networks:
+  backend:
+    driver: bridge
+  # Separate network for DB to limit attack surface
+  db_network:
+    driver: bridge
+
+# ── Volumes ────────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  chroma_data:
+    driver: local
+  upload_data:
+    driver: local
+  logs_data:
+    driver: local
+
+services:
+
+  # ── PostgreSQL (tuned for 8GB dev machine) ─────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: rag_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rag_saas}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres_init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command: >
+      postgres -c shared_buffers=128MB -c effective_cache_size=256MB -c maintenance_work_mem=32MB -c checkpoint_completion_target=0.9 -c wal_buffers=4MB -c default_statistics_target=100 -c random_page_cost=1.1 -c effective_io_concurrency=200 -c work_mem=2MB -c min_wal_size=256MB -c max_wal_size=1GB -c max_connections=50 -c log_min_duration_statement=500 -c log_checkpoints=on
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-rag_saas}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - db_network
+    ports:
+      - "5432:5432"
+
+  # ── Redis (reduced memory for local dev) ───────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: rag_redis
+    restart: unless-stopped
+    command: >
+      redis-server --requirepass ${REDIS_PASSWORD:-redispassword} --maxmemory 64mb --maxmemory-policy allkeys-lru --save 900 1 --save 300 10
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "--pass", "${REDIS_PASSWORD:-redispassword}", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - backend
+    ports:
+      - "6379:6379"
+
+  # ── ChromaDB (persistent vector store) ─────────────────────────────────────
+  # ChromaDB is embedded inside the API container via PersistentClient.
+  # No separate service needed — data is stored in the chroma_data volume.
+
+  # ── FastAPI Application (dev mode with hot reload) ─────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: rag_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Application
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is required}
+      # Database
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rag_saas}
+      # LLM / Embedding provider selection
+      LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-gemini}
+      # Gemini Flash LLM + Embeddings
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?GEMINI_API_KEY is required}
+      GEMINI_MODEL: ${GEMINI_MODEL:-models/gemma-3-12b-it}
+      GEMINI_MAX_TOKENS: ${GEMINI_MAX_TOKENS:-2048}
+      GEMINI_TEMPERATURE: "0.01"
+      GEMINI_EMBEDDING_MODEL: ${GEMINI_EMBEDDING_MODEL:-models/gemini-embedding-001}
+      # Storage
+      UPLOAD_BASE_DIR: /app/data/uploads
+      CHROMA_PERSIST_DIR: /app/data/chroma
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
+      LOG_FILE: /app/logs/app.log
+      # CORS (permissive for local dev)
+      CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000","http://localhost:8080"]}
+      # Redis
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redispassword}@redis:6379/0
+    volumes:
+      - chroma_data:/app/data/chroma
+      - upload_data:/app/data/uploads
+      - logs_data:/app/logs
+      # Mount source code for hot reload in development
+      - ./app:/app/app:ro
+    # Dev mode: single uvicorn worker with hot reload
+    command: >
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/app --log-level debug
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - backend
+      - db_network
+    ports:
+      - "8000:8000"
+
+  # ── Alembic Migration Runner ───────────────────────────────────────────────
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: rag_migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rag_saas}
+      SECRET_KEY: ${SECRET_KEY:-placeholder}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-placeholder}
+    command: alembic upgrade head
+    restart: "no"
+    networks:
+      - db_network
